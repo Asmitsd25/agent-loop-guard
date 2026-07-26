@@ -19,29 +19,84 @@ class Request(BaseModel):
 
 
 def normalize_string(s: str):
+    # Ignore whitespace-only differences
     return re.sub(r"\s+", " ", s).strip()
 
 
-def canonicalize(obj):
+def canonicalize(obj: Any):
+    # Remove client_ts recursively, sort keys, normalize strings
     if isinstance(obj, dict):
         return {
             k: canonicalize(v)
             for k, v in sorted(obj.items())
             if k != "client_ts"
         }
-    elif isinstance(obj, list):
+
+    if isinstance(obj, list):
         return [canonicalize(x) for x in obj]
-    elif isinstance(obj, str):
+
+    if isinstance(obj, str):
         return normalize_string(obj)
-    else:
-        return obj
+
+    return obj
 
 
-def same_call(a, b):
+def same_call(a: Step, b: Step) -> bool:
     return (
         a.tool == b.tool
         and canonicalize(a.args) == canonicalize(b.args)
     )
+
+
+def has_three_identical_calls(steps: List[Step]) -> bool:
+    run = 1
+
+    for i in range(1, len(steps)):
+        if same_call(steps[i], steps[i - 1]):
+            run += 1
+            if run >= 3:
+                return True
+        else:
+            run = 1
+
+    return False
+
+
+def has_alternating_cycle(steps: List[Step]) -> bool:
+    """
+    Detect any trailing
+    A B A B A B ...
+    pattern of length >=6.
+    """
+
+    n = len(steps)
+
+    if n < 6:
+        return False
+
+    # Try every possible trailing length
+    for length in range(6, n + 1):
+
+        tail = steps[-length:]
+
+        # Need two distinct calls
+        if same_call(tail[0], tail[1]):
+            continue
+
+        ok = True
+
+        for i in range(length):
+
+            expected = tail[i % 2]
+
+            if not same_call(tail[i], expected):
+                ok = False
+                break
+
+        if ok:
+            return True
+
+    return False
 
 
 @app.post("/")
@@ -49,44 +104,26 @@ def guard(req: Request):
 
     total = sum(step.tokens_used for step in req.steps)
 
-    # Budget check
+    # Budget rule
     if total >= req.budget_tokens:
         return {
             "decision": "halt",
             "reason": f"Cumulative tokens_used ({total}) has reached the budget ({req.budget_tokens})."
         }
 
-    # 3 identical consecutive calls
-    run = 1
+    # 3+ identical consecutive calls
+    if has_three_identical_calls(req.steps):
+        return {
+            "decision": "halt",
+            "reason": "Detected three or more identical consecutive tool calls."
+        }
 
-    for i in range(1, len(req.steps)):
-        if same_call(req.steps[i], req.steps[i - 1]):
-            run += 1
-
-            if run >= 3:
-                return {
-                    "decision": "halt",
-                    "reason": "Detected three or more identical consecutive tool calls."
-                }
-        else:
-            run = 1
-
-    # Detect trailing ABABAB cycle
-    if len(req.steps) >= 6:
-
-        tail = req.steps[-6:]
-
-        if (
-            same_call(tail[0], tail[2]) and
-            same_call(tail[2], tail[4]) and
-            same_call(tail[1], tail[3]) and
-            same_call(tail[3], tail[5]) and
-            not same_call(tail[0], tail[1])
-        ):
-            return {
-                "decision": "halt",
-                "reason": "Detected repeating two-step cycle."
-            }
+    # Alternating A/B cycle
+    if has_alternating_cycle(req.steps):
+        return {
+            "decision": "halt",
+            "reason": "Detected repeating two-step cycle."
+        }
 
     return {
         "decision": "continue",
